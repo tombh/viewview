@@ -1,0 +1,88 @@
+<!doctype html>
+<html>
+
+<head>
+	<meta charset="utf-8" />
+	<title>Martin Raster Tiles (Leaflet)</title>
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+	<style>
+		html,
+		body,
+		#map {
+			height: 100%;
+			margin: 0;
+			padding: 0;
+		}
+	</style>
+</head>
+
+<body>
+	<div id="map"></div>
+
+	<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+	<script>
+		// Replace with your Martin tiles endpoint (XYZ template)
+		const TILE_URL = 'http://localhost:3000/output/{z}/{x}/{y}';
+
+
+
+		// Initial view (lat, lon, zoom) — change to a location that matches your tiles' CRS
+		const map = L.map('map', {
+			center: [51.5, -3.25],
+			zoom: 10,
+			preferCanvas: true
+		});
+
+		const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+			maxZoom: 19,
+			attribution: '&copy; OpenStreetMap contributors'
+		}).addTo(map);
+		// Raster tile layer from Martin
+		const martinLayer = L.tileLayer(TILE_URL, {
+			tms: false,           // set true if tiles are in TMS (y flipped)
+			attribution: '&copy; your attribution'
+		}).addTo(map);
+
+		// Optional: Add a simple legend/control
+		const info = L.control({position: 'topright'});
+		info.onAdd = function () {
+			const div = L.DomUtil.create('div', 'info');
+			div.style.background = 'rgba(255,255,255,0.8)';
+			div.style.padding = '6px';
+			div.style.borderRadius = '4px';
+			div.innerHTML = '<strong>Martin Raster Tiles</strong><br>Source: ' + TILE_URL;
+			return div;
+		};
+		info.addTo(map);
+
+		// If Martin serves Terrain-RGB encoded elevation tiles and you want to decode elevation at a click:
+		map.on('click', async function (e) {
+			const z = map.getZoom();
+			const tileSize = 256;
+			const tileX = Math.floor((e.latlng.lng + 180) / 360 * Math.pow(2, z));
+			const tileY = Math.floor(
+				(1 - Math.log(Math.tan(e.latlng.lat * Math.PI / 180) + 1 / Math.cos(e.latlng.lat * Math.PI / 180)) / Math.PI) / 2 * Math.pow(2, z)
+			);
+			const url = TILE_URL.replace('{z}', z).replace('{x}', tileX).replace('{y}', tileY);
+			try {
+				const resp = await fetch(url);
+				const blob = await resp.blob();
+				const img = await createImageBitmap(blob);
+				const canvas = new OffscreenCanvas(tileSize, tileSize);
+				const ctx = canvas.getContext('2d');
+				ctx.drawImage(img, 0, 0, tileSize, tileSize);
+				const px = Math.floor(((e.latlng.lng + 180) / 360 * Math.pow(2, z) - tileX) * tileSize);
+				const py = Math.floor(((1 - Math.log(Math.tan(e.latlng.lat * Math.PI / 180) + 1 / Math.cos(e.latlng.lat * Math.PI / 180)) / Math.PI) / 2 * Math.pow(2, z) - tileY) * tileSize);
+				const data = ctx.getImageData(px, py, 1, 1).data; // RGBA bytes
+				// Decode Terrain-RGB if used: elevation = -10000 + ((R*256*256 + G*256 + B) * 0.01)
+				const elevation = -10000 + ((data[0] * 65536 + data[1] * 256 + data[2]) * 0.01);
+				alert('Elevation ~' + elevation.toFixed(2) + ' m');
+			} catch (err) {
+				console.error(err);
+			}
+		});
+	</script>
+</body>
+
+</html>
