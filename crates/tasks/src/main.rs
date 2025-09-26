@@ -1,4 +1,8 @@
 //! sdf
+#![expect(
+    clippy::panic_in_result_fn,
+    reason = "This is just code for short tasks, so panicking is better"
+)]
 #![cfg_attr(
     test,
     expect(
@@ -9,20 +13,57 @@
     )
 )]
 
+mod config;
 mod max_subtile;
+mod packer;
+mod projector;
+mod tile;
 
+use clap::Parser as _;
 use color_eyre::Result;
 use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
+/// The file name for the max subtiles data.
+const SUBTILES_FILE: &str = "max_subtiles.bin";
+
 fn main() -> Result<()> {
-    let file = "max_subtiles.bin";
     setup_logging()?;
 
-    // let saved = max_subtile::Subtiler::load(file)?;
-    // tracing::info!("{}", saved.len());
-    // std::process::exit(0);
+    let config = crate::config::Config::parse();
+    tracing::info!("Initialising with config: {config:?}",);
 
-    let mut subtiler = max_subtile::Subtiler::new(10, srtm_reader::Resolution::SRTM3.extent())?;
+    match &config.command {
+        crate::config::Commands::Packer(packer_config) => {
+            let mut packer = packer::Packer::new(packer_config.clone())?;
+            match packer_config.one {
+                Some(coordinate) => packer.run_one(geo::coord! {
+                    x: coordinate.0.into(),
+                    y: coordinate.1.into()
+                })?,
+                None => packer.run_all()?,
+            }
+        }
+        crate::config::Commands::MaxSubTiles(_) => max_subtiles()?,
+    }
+
+    Ok(())
+}
+
+/// Setup logging.
+fn setup_logging() -> Result<()> {
+    let filters = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive("info".parse()?)
+        .from_env_lossy();
+    let filter_layer = tracing_subscriber::fmt::layer().with_filter(filters);
+    let tracing_setup = tracing_subscriber::registry().with(filter_layer);
+    tracing_setup.init();
+
+    Ok(())
+}
+
+/// Create the max subtiles acceleration structure.
+fn max_subtiles() -> Result<()> {
+    let mut subtiler = max_subtile::Subtiler::new(10, srtm_reader::Resolution::SRTM3.extent());
     let mut count = 0u32;
     let dir = std::path::Path::new("/publicish/dems");
     let entries = std::fs::read_dir(dir)?;
@@ -50,19 +91,7 @@ fn main() -> Result<()> {
         tracing::warn!("{} invalid subtiles", subtiler.invalid_count);
     }
 
-    subtiler.save(file)?;
-
-    Ok(())
-}
-
-/// Setup logging.
-fn setup_logging() -> Result<()> {
-    let filters = tracing_subscriber::EnvFilter::builder()
-        .with_default_directive("info".parse()?)
-        .from_env_lossy();
-    let filter_layer = tracing_subscriber::fmt::layer().with_filter(filters);
-    let tracing_setup = tracing_subscriber::registry().with(filter_layer);
-    tracing_setup.init();
+    subtiler.save(SUBTILES_FILE)?;
 
     Ok(())
 }

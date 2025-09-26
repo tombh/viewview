@@ -1,0 +1,104 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Leaflet GeoJSON Tiles</title>
+
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
+
+  <style>
+    html,body,#map { height: 100%; margin: 0; padding: 0; }
+    .tile-label {
+      font-size: 12px;
+      font-weight: 600;
+      color: #222;
+      text-shadow: 0 1px 0 #fff;
+      background: rgba(255,255,255,0.7);
+      padding: 2px 4px;
+      border-radius: 3px;
+      border: 1px solid rgba(0,0,0,0.08);
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+
+  <script>
+    // Basic map
+    const map = L.map('map').setView([0, 0], 2);
+
+    // Basemap
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    // Styling function for GeoJSON features (AABB tiles as polygons)
+    function tileStyle(feature) {
+      return {
+        color: '#2b8cbe',
+        weight: 1,
+        fillColor: '#7fb3d5',
+        fillOpacity: 0.35
+      };
+    }
+
+    // Optional label: shows feature.properties.id or index
+    function onEachFeature(feature, layer) {
+      const id = feature?.properties?.id ?? feature?.properties?.tile ?? null;
+      if (id != null) {
+        const center = layer.getBounds ? layer.getBounds().getCenter() : null;
+        if (center) {
+          const label = L.divIcon({
+            className: 'tile-label',
+            html: String(id),
+            iconSize: null
+          });
+          L.marker(center, { icon: label, interactive: false }).addTo(map);
+        }
+      }
+      // popup with raw props
+      layer.bindPopup(`<pre>${JSON.stringify(feature.properties || {}, null, 2)}</pre>`, { maxHeight: 200 });
+    }
+
+    // Fetch GeoJSON from local static path
+    fetch('/static/tiles.json')
+      .then(res => {
+        if (!res.ok) throw new Error('Failed to fetch tiles.json: ' + res.status);
+        return res.json();
+      })
+      .then(geojson => {
+        const layer = L.geoJSON(geojson, {
+          style: tileStyle,
+          onEachFeature: onEachFeature
+        }).addTo(map);
+
+        // Fit to data if available
+        if (layer.getBounds && !layer.getBounds().isValid()) {
+          console.warn('GeoJSON layer has no valid bounds.');
+        } else if (layer.getBounds) {
+          map.fitBounds(layer.getBounds(), { padding: [20, 20] });
+        }
+      })
+      .catch(err => {
+        console.error(err);
+        const el = document.createElement('div');
+        el.style.position = 'absolute';
+        el.style.top = '10px';
+        el.style.left = '10px';
+        el.style.background = 'rgba(255,255,255,0.9)';
+        el.style.padding = '6px 10px';
+        el.style.border = '1px solid #ccc';
+        el.textContent = 'Error loading tiles.json — check console.';
+        document.body.appendChild(el);
+      });
+  </script>
+</body>
+</html>
+

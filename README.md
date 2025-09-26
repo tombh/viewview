@@ -6,13 +6,14 @@ How to use the data from https://www.viewfinderpanoramas.org/Coverage%20map%20vi
 
 How to find a tiling of the world's landmass, where the size of each tile must meet a minimum size based on the elevations that that the tile covers?
 
-* There are approximately 200,000 600km² tiles covering all the land on the planet.
-* It'd be good to both use larger tiles, say over Everest, and smaller tiles for islands etc.
+* There are approximately 500 600km² tiles covering all the land on the planet.
+* It'd be good to both use 600km² tiles, say over Everest, but most of the planet probably only needs 150km².
 
-1. Create a version of the global DEM data where for every N degree minute/second subtiles I find the highest point. Record the elevation, the highest points lat/lon and the centre of the subtile.
+### Steps
+1. Create a version of the global DEM data where for every N degree minute/second subtile we find the highest point. Record that highest point and the subtile's lon/lat.
 2. For each subtile:
-  1. Create an actual tile that fits the highest elevation in all the tiles it covers.
-  2. The tile should have a minimum overlap outside any subtiles.
+  1. Create a bounding box representing a Total Viewshed calculable tile that fits the highest elevation of all the subtiles it covers.
+  2. The bound should have a minimum overlap of the regions outside any subtiles, therefore basically it should contain a minimum amount of ocean.
   3. The tile should have a minimum overlap with other tiles.
 3. Move on to the next subtile. If it's already been covered by a previous increased tile then move on.
 4. Score the final tile based on tile overlaps and going outside the subtiles. Hopefully this is all fast enough that we can brute force a low score. How to change the starting conditions?
