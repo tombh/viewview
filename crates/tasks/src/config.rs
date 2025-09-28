@@ -27,7 +27,11 @@ pub enum Commands {
 #[derive(clap::Parser, Debug, Clone)]
 pub struct Packer {
     /// Just run for one step
-    #[arg(long, value_parser = parse_coord, value_name = "The centre of the computation step, eg: -2.1,54.0")]
+    #[arg(
+        long,
+        value_parser = parse_coord,
+        value_name = "The centre of the computation step, eg: -2.1,54.0")
+    ]
     pub one: Option<(f32, f32)>,
 }
 

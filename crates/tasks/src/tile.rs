@@ -2,6 +2,9 @@
 
 use color_eyre::{Result, eyre::ContextCompat as _};
 use geo::{BoundingRect as _, GeodesicArea as _, polygon};
+use rstar::PointDistance as _;
+
+use crate::projector::LatLonCoord;
 
 /// The tile data itself.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -114,5 +117,13 @@ impl Tile {
             reason = "Is there another way?"
         )]
         Ok(polygon.geodesic_area_unsigned() as f32)
+    }
+
+    /// Calculate the distance in meters of the tile from the given point.
+    pub fn distance_from(&self, point_lonlat: LatLonCoord) -> Result<f64> {
+        let projector = crate::projector::Convert { base: point_lonlat };
+        let point = projector.to_meters(self.centre)?;
+
+        Ok(self.centre_metric(point_lonlat)?.distance_2(&point).sqrt())
     }
 }

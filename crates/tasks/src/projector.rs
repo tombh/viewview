@@ -15,14 +15,14 @@ pub struct Convert {
 impl Convert {
     /// The projection description for lat/lon.
     fn degrees_projection() -> Result<proj4rs::Proj> {
-        let string = "+proj=latlong +datum=WGS84";
+        let string = "+proj=latlong +datum=WGS84 +over";
         Ok(proj4rs::Proj::from_proj_string(string)?)
     }
 
     /// The projection description for the AEQD metric projection.
     fn meters_projection(&self) -> Result<proj4rs::Proj> {
         let string = format!(
-            "+proj=aeqd +lat_0={} +lon_0={} +datum=WGS84",
+            "+proj=aeqd +lat_0={} +lon_0={} +datum=WGS84 +over",
             self.base.0.y, self.base.0.x
         );
         Ok(proj4rs::Proj::from_proj_string(&string)?)
