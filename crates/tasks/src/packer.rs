@@ -14,9 +14,6 @@ use rstar::PointDistance as _;
 
 use crate::projector::LatLonCoord;
 
-/// The radius of the planet in kilometers.
-const EARTH_RADIUS: f32 = 6371.0;
-
 /// The minimum elevation inside a tile to start considering larger tiles from. Another way of
 /// looking at this is rather the minimum _width_ of tile, as tile widths are primarilly dictated
 /// by the maximum point of elevation inside them. We don't use 0m because in fact the lowest
@@ -25,13 +22,6 @@ const EARTH_RADIUS: f32 = 6371.0;
 /// we just choose a reasonable low elevation that generates tile sizes worthy of going to the
 /// effort of calculating for.
 const MINIMUM_HEIGHT: i32 = 100;
-
-/// Currently this is to get around an edge case were tiles that end exactly on their final points,
-/// don't overlap with other tiles. A better solutioin would be a final pass were every tile is
-/// increased by the minimum metric resolution of the tile's four corners. It of course would also
-/// require that each tile's contents are rescanned to see if the size increase includes a higher
-/// elevation that in turn would require another tile resize.
-const FUDGE: f32 = 0.1;
 
 /// The maximum radius in meters of the moving window view.
 ///
@@ -100,15 +90,30 @@ impl Packer {
 
     /// Run for the entire globe.
     pub fn run_all(&mut self) -> Result<()> {
-        let mut centre = LatLonCoord((-180.0f64, 80.0f64).into());
+        let default_start = (-180.0f64, 90.0f64);
+        let mut centre = LatLonCoord(self.config.start.unwrap_or(default_start).into());
 
-        while (-80.0f64..=80.0f64).contains(&centre.0.y) {
+        let mut steps = 0u32;
+        while (-90.0f64..=90.0f64).contains(&centre.0.y) {
+            if let Some(stop_at_step) = self.config.steps
+                && steps >= stop_at_step
+            {
+                break;
+            }
+
             let longtitude_step = Self::calculate_longtitude_step(centre.0.y);
             let mut is_last_longitude = false;
             while (-180.0f64..=180.0f64).contains(&centre.0.x) {
+                if let Some(stop_at_step) = self.config.steps
+                    && steps >= stop_at_step
+                {
+                    break;
+                }
+
                 tracing::debug!("Calculating tiles for window centred at: {centre:?}");
 
                 self.run_one(centre)?;
+                self.nudge_extend_window_tiles()?;
                 self.move_tiles_to_all()?;
                 self.remove_inefficient_tiles()?;
                 self.save_tiles_as_geojson()?;
@@ -125,6 +130,8 @@ impl Packer {
                     centre.0.x = 180.0f64;
                     is_last_longitude = true;
                 }
+
+                steps += 1;
             }
             centre = Self::start_new_latitude(centre)?;
         }
@@ -144,17 +151,7 @@ impl Packer {
 
     /// Calculate the number of degrees to go Eastward to reach the next window.
     fn calculate_longtitude_step(latitude: f64) -> f64 {
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::as_conversions,
-            reason = "It's the only way"
-        )]
-        let meters_per_degree = (EARTH_RADIUS
-            * 1000.0
-            * latitude.to_radians().cos() as f32
-            * (std::f32::consts::PI / 180.0))
-            .abs();
-        let degrees_per_meter = 1.0 / meters_per_degree;
+        let degrees_per_meter = 1.0 / crate::projector::Convert::meters_per_degree(latitude);
         f64::from(degrees_per_meter) * WINDOW_STEP
     }
 
@@ -174,8 +171,9 @@ impl Packer {
         self.iterate()?;
 
         if self.config.one.is_some() {
-            self.save_tiles_as_geojson()?;
+            self.nudge_extend_window_tiles()?;
             self.remove_inefficient_tiles()?;
+            self.save_tiles_as_geojson()?;
         }
 
         Ok(())
@@ -333,12 +331,10 @@ impl Packer {
         &self,
         tile: &crate::tile::Tile,
     ) -> Result<Vec<rstar::primitives::GeomWithData<geo::Coord, i32>>> {
-        let tile_polygon = tile.to_polygon_metric(self.current_window_centre(), 0.0)?;
+        let tile_polygon = tile.to_polygon_metric(self.current_window_centre())?;
         let mut covered_points: Vec<ElevationRstar> = self
             .window
-            .locate_in_envelope_intersecting(
-                &tile.to_aabb_metric(self.current_window_centre(), 0.0)?,
-            )
+            .locate_in_envelope_intersecting(&tile.to_aabb_metric(self.current_window_centre())?)
             .copied()
             .collect();
         covered_points.retain(|point| point.geom().is_within(&tile_polygon));
@@ -488,9 +484,7 @@ impl Packer {
         let first_width = tile.data.width;
         let step = 100.0;
         loop {
-            let polygon = tile
-                .data
-                .to_polygon_metric(self.current_window_centre(), 0.0)?;
+            let polygon = tile.data.to_polygon_metric(self.current_window_centre())?;
             if !point.geom().is_within(&polygon) {
                 #[expect(
                     clippy::float_cmp,
@@ -620,7 +614,7 @@ impl Packer {
         )]
         let elevation = elevation_i32 as f32;
 
-        (2.0 * EARTH_RADIUS * 1000.0)
+        (2.0 * crate::projector::EARTH_RADIUS * 1000.0)
             .mul_add(elevation, elevation.powi(2))
             .sqrt()
             * 2.0
@@ -637,16 +631,11 @@ impl Packer {
 
         // The AABB is quicker to search within but is also slightly rotated in AEQD projections
         // so we need a second step to clip points outide of the tile's real extent.
-        let tile_aabb = tile.to_aabb_metric(self.current_window_centre(), 0.0)?;
+        let tile_aabb = tile.to_aabb_metric(self.current_window_centre())?;
         let aabb_points = self.window.locate_in_envelope_intersecting(&tile_aabb);
 
-        // `is_within()` for a metric polygon converted from lonlat is not 100% reliable. The worst
-        // case would be if we removed points that weren't actually in the polygon. So we make it a
-        // little smaller, so that the worst case is just that points that are actually in this
-        // polygon get handled by another tile. It's basically how we ensure a minimum amount of
-        // overlap.
-        let covered_points_polygon = tile.to_polygon_metric(self.current_window_centre(), FUDGE)?;
-        let highest_points_polygon = tile.to_polygon_metric(self.current_window_centre(), 0.0)?;
+        let covered_points_polygon = tile.to_polygon_metric(self.current_window_centre())?;
+        let highest_points_polygon = tile.to_polygon_metric(self.current_window_centre())?;
 
         let mut current_highest = i32::MIN;
         let mut is_non_zero_detected = false;
@@ -760,21 +749,63 @@ impl Packer {
         Ok(super_tile.contains(&polygon))
     }
 
+    /// Where the source of completed tiles are.
+    const fn source_of_tiles(
+        &self,
+    ) -> &rstar::RTree<rstar::primitives::GeomWithData<geo::Coord, crate::tile::Tile>> {
+        match self.config.one {
+            Some(_) => &self.tiles,
+            None => &self.all,
+        }
+    }
+
+    /// Extend each tile by the resolution of the underlying max subtile data.
+    ///
+    /// Consider the case where 2 tiles perfectly align in the sense that one starts at the next
+    /// row or column of points where the adjacent tile finished. This would mean that there is gap
+    /// of exactly one max-subtile-resolution unit between the 2 tiles edges. This gap is _degree_
+    /// based so the actual metric distance varies by latitude. And couple that with the fact that
+    /// tiles have to be perfectly square, we can't just increase problematic tile edges by a
+    /// constant amount.
+    fn nudge_extend_window_tiles(&mut self) -> Result<()> {
+        tracing::info!(
+            "Nudge extending tiles ({}) in window to ensure they overlap.",
+            self.tiles.size()
+        );
+
+        // This depends on the resolution set in the max-subtile pre-process step. It's not good
+        // that we hardcode it here :/
+        let subtile_resolution = 10.0;
+        // Just add a little more for safe measure. Thought the better aproach would be to take the
+        // latitude of the tile corner that is furthest from the equator.
+        let magic = 1.5;
+
+        let mut tiles = Vec::new();
+        for mut tile in self.tiles.iter().copied() {
+            let latitude = tile.data.centre.0.y;
+            let extension = (crate::projector::Convert::meters_per_degree(latitude)
+                / subtile_resolution)
+                * magic;
+            tile.data.width += extension;
+            tiles.push(tile);
+            self.ensure_tile_is_big_enough(&mut tile)?;
+        }
+
+        self.tiles = rstar::RTree::bulk_load(tiles);
+
+        Ok(())
+    }
+
     /// Save the tiles to [`GeoJSON`].
     fn save_tiles_as_geojson(&self) -> Result<()> {
         let mut features: Vec<geo::Geometry> = Vec::new();
         let path = "static/tiles.json";
-        let source = match self.config.one {
-            Some(_) => &self.tiles,
-            None => &self.all,
-        };
-
-        for tile in source {
-            let geojson_tile = tile.data.to_polygon_lonlat_fudged(FUDGE)?;
+        for tile in self.source_of_tiles() {
+            let geojson_tile = tile.data.to_polygon_lonlat()?;
             features.push(geojson_tile.into());
         }
 
-        tracing::info!("Saving {} tiles to: {path}", source.size());
+        tracing::info!("Saving {} tiles to: {path}", self.source_of_tiles().size());
         let feature_collection = geojson::FeatureCollection::from(&features.into());
         let json = geojson::GeoJson::from(feature_collection);
         std::fs::write(path, json.to_string())?;

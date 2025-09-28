@@ -39,8 +39,8 @@ fn main() -> Result<()> {
             let mut packer = packer::Packer::new(packer_config.clone())?;
             match packer_config.one {
                 Some(coordinate) => packer.run_one(LatLonCoord(geo::coord! {
-                    x: coordinate.0.into(),
-                    y: coordinate.1.into()
+                    x: coordinate.0,
+                    y: coordinate.1
                 }))?,
                 None => packer.run_all()?,
             }

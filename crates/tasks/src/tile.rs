@@ -32,7 +32,6 @@ impl Tile {
     /// units.
     fn to_bbox_lonlat(
         self,
-        fudge: f32,
     ) -> Result<(
         crate::projector::LatLonCoord,
         crate::projector::LatLonCoord,
@@ -40,7 +39,7 @@ impl Tile {
         crate::projector::LatLonCoord,
     )> {
         let projecter = crate::projector::Convert { base: self.centre };
-        let offset = self.offset() * f64::from(1.0 + fudge);
+        let offset = self.offset();
         let top_left = projecter.to_degrees(geo::coord! { x: -offset, y: offset })?;
         let top_right = projecter.to_degrees(geo::coord! { x: offset, y: offset })?;
         let bottom_right = projecter.to_degrees(geo::coord! { x: offset, y: -offset })?;
@@ -54,9 +53,8 @@ impl Tile {
     fn to_bbox_metric(
         self,
         anchor: crate::projector::LatLonCoord,
-        fudge: f32,
     ) -> Result<(geo::Coord, geo::Coord, geo::Coord, geo::Coord)> {
-        let bbox_lonlat = self.to_bbox_lonlat(fudge)?;
+        let bbox_lonlat = self.to_bbox_lonlat()?;
 
         let anchor_projector = crate::projector::Convert { base: anchor };
         Ok((
@@ -75,10 +73,9 @@ impl Tile {
     pub fn to_aabb_metric(
         self,
         anchor: crate::projector::LatLonCoord,
-        fudge: f32,
     ) -> Result<rstar::AABB<geo::Coord>> {
         let bbox = self
-            .to_polygon_metric(anchor, fudge)?
+            .to_polygon_metric(anchor)?
             .bounding_rect()
             .context(format!("Couldn't find bbox for tile: {self:?}"))?;
         let aabb = rstar::AABB::from_corners(bbox.min(), bbox.max());
@@ -88,23 +85,13 @@ impl Tile {
 
     /// Lon/lat polygon of tile.
     pub fn to_polygon_lonlat(self) -> Result<geo::Polygon> {
-        let bbox = self.to_bbox_lonlat(0.0)?;
+        let bbox = self.to_bbox_lonlat()?;
         Ok(polygon![bbox.0.0, bbox.1.0, bbox.2.0, bbox.3.0, bbox.0.0])
     }
 
-    /// Hack to get around tiles that don't overlap.
-    pub fn to_polygon_lonlat_fudged(self, fudge: f32) -> Result<geo::Polygon> {
-        let bbox = self.to_bbox_lonlat(fudge)?;
-        Ok(polygon![bbox.0.0, bbox.1.0, bbox.2.0, bbox.3.0, bbox.0.0,])
-    }
-
     /// Metric polygon of tile.
-    pub fn to_polygon_metric(
-        self,
-        anchor: crate::projector::LatLonCoord,
-        fudge: f32,
-    ) -> Result<geo::Polygon> {
-        let bbox = self.to_bbox_metric(anchor, fudge)?;
+    pub fn to_polygon_metric(self, anchor: crate::projector::LatLonCoord) -> Result<geo::Polygon> {
+        let bbox = self.to_bbox_metric(anchor)?;
         Ok(polygon![bbox.0, bbox.1, bbox.2, bbox.3, bbox.0])
     }
 

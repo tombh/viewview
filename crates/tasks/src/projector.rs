@@ -2,6 +2,9 @@
 
 use color_eyre::Result;
 
+/// The radius of the planet in kilometers.
+pub const EARTH_RADIUS: f32 = 6371.0;
+
 /// A latitude/longtitude coordinate.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Default)]
 pub struct LatLonCoord(pub geo::Coord);
@@ -52,6 +55,20 @@ impl Convert {
         Ok(LatLonCoord(
             geo::coord! { x: converted.0.to_degrees(), y: converted.1.to_degrees() },
         ))
+    }
+
+    /// Calculate the width of a degree in meters at the given latitude.
+    pub fn meters_per_degree(latitude: f64) -> f32 {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::as_conversions,
+            reason = "It's the only way"
+        )]
+        (EARTH_RADIUS
+            * 1000.0
+            * latitude.to_radians().cos() as f32
+            * (std::f32::consts::PI / 180.0))
+            .abs()
     }
 }
 

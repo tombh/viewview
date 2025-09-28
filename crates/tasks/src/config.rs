@@ -32,7 +32,19 @@ pub struct Packer {
         value_parser = parse_coord,
         value_name = "The centre of the computation step, eg: -2.1,54.0")
     ]
-    pub one: Option<(f32, f32)>,
+    pub one: Option<(f64, f64)>,
+
+    /// Coordinate to start the whole world from. Useful for debugging.
+    #[arg(
+        long,
+        value_parser = parse_coord,
+        value_name = "Starting coordinate")
+    ]
+    pub start: Option<(f64, f64)>,
+
+    /// How many window steps to take Useful for debugging.
+    #[arg(long, value_name = "Number of steps")]
+    pub steps: Option<u32>,
 }
 
 /// `carg run max-sub-tiles` arguments.
@@ -40,11 +52,11 @@ pub struct Packer {
 pub struct MaxSubTiles;
 
 /// Parse a single coordinate.
-fn parse_coord(string: &str) -> Result<(f32, f32)> {
+fn parse_coord(string: &str) -> Result<(f64, f64)> {
     let mut coordinates = Vec::new();
 
     for coordinate in string.split(',') {
-        coordinates.push(coordinate.parse::<f32>()?);
+        coordinates.push(coordinate.parse::<f64>()?);
     }
 
     if coordinates.len() != 2 {
