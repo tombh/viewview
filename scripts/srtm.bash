@@ -53,7 +53,10 @@ function unzip_srtms {
 				rm "$subzip"
 			done
 			find "$directory" -name "*.hgt" | while read -r hgt; do
-				mv "$hgt" .
+				file=$(basename "$hgt")
+				base="${file%.*}"
+				uppercased=$(printf '%s' "$base" | tr '[:lower:]' '[:upper:]')
+				mv "$hgt" "$uppercased.hgt"
 			done
 			rmdir "$directory" || true
 		done
