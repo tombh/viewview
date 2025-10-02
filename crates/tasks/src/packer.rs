@@ -882,7 +882,7 @@ impl Packer {
         let subtile_resolution = 10.0;
         // Just add a little more for safe measure. Though the better aproach would be to take the
         // latitude of the tile corner that is furthest from the equator.
-        let magic = 2.0;
+        let magic = 1.5;
         let latitude = tile.data.centre.0.y;
         let extension =
             (crate::projector::Convert::meters_per_degree(latitude) / subtile_resolution) * magic;
@@ -970,5 +970,23 @@ impl Packer {
         std::fs::write(path, json.to_string())?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[expect(
+        clippy::float_cmp,
+        reason = "Theren't aren't enough decimal places to worry about this"
+    )]
+    #[test]
+    fn minimum_tile_size_for_elevation() {
+        assert_eq!(Packer::minimum_tile_size_for_elevation(0), 36_000.0);
+        assert_eq!(Packer::minimum_tile_size_for_elevation(1000), 225_769.8);
+        assert_eq!(Packer::minimum_tile_size_for_elevation(3000), 391_075.44);
+        assert_eq!(Packer::minimum_tile_size_for_elevation(8000), 638_748.75);
+        assert_eq!(Packer::minimum_tile_size_for_elevation(8848), 671_772.3);
     }
 }

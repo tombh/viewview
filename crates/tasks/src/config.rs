@@ -29,6 +29,7 @@ pub struct Packer {
     /// Just run for one step
     #[arg(
         long,
+        allow_hyphen_values(true),
         value_parser = parse_coord,
         value_name = "The centre of the computation step, eg: -2.1,54.0")
     ]
@@ -37,6 +38,7 @@ pub struct Packer {
     /// Coordinate to start the whole world from. Useful for debugging.
     #[arg(
         long,
+        allow_hyphen_values(true),
         value_parser = parse_coord,
         value_name = "Starting coordinate")
     ]

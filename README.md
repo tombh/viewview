@@ -1,39 +1,44 @@
 # A View Of All Views
 
-How to use the data from https://www.viewfinderpanoramas.org/Coverage%20map%20viewfinderpanoramas_org3.htm fed into https://github.com/tombh/total-viewsheds and display on views.tombh.co.uk
+This repo is for all the supporting code used to find and display the longest line of sight on the planet.
 
-## Design
+The main viewshed algorithm is another repo https://github.com/tombh/total-viewsheds
 
-How to find a tiling of the world's landmass, where the size of each tile must meet a minimum size based on the elevations that that the tile covers?
+The raw elevation data is currently from (October 2025) https://www.viewfinderpanoramas.org/Coverage%20map%20viewfinderpanoramas_org3.htm Other sources of data are available, notably via AWS's https://registry.opendata.aws/terrain-tiles, but as far as I can tell viewfinderpanoramas.org offers a cleaned version, removing noisy data and filling in voids with other sources.
 
-* There are approximately 500 600km² tiles covering all the land on the planet.
-* It'd be good to both use 600km² tiles, say over Everest, but most of the planet probably only needs 150km².
+## Packer
+
+![Map of all the longest line of sight tiles in the world](/assets/world_packed.webp)
+
+This map shows a not-terrible packing of the minimum tiles needed to guarantee searching every line of sight on the planet.
+
+To calculate any [viewshed](https://en.wikipedia.org/wiki/Viewshed), and therefore line of sight, you must inevitably provide more data than ends up being used. This is to say that you don't know the limits of what you can see from a given point until you actually calculate it. The only limit you can calculate beforehand is the longest _theoretical_ line of sight based on the highest points within the region you're interested in.
+
+Here are some examples, they are for 2 peaks of the same height and the maximum distance that they could see each other from:
+
+* 8848m  670km
+* 6km    553km
+* 4km    452km
+* 2km    319km
+* 1km    226km
+* 0.5km  160km
+* 1.65m  9km (height of an average human)
+
+Formula: √(2 * Earth Radius * height) * 2
+
+So as long as you provide the raw data within these theoretical limits then you are at least guaranteed to have complete viewsheds. The worst that can happen is that RAM and CPU cycles are wasted on calculating lines that have already terminated.
+
+We could just cover the world with hundreds of 670km x 670km squares and calculate all the lines of sight inside each one. But that's only really necessary in the Himalayas. But then if we start using different size squares (let's call them tiles), then we face the problem of them not packing well. We start to get overlaps which again introduce lots of wasted RAM and CPU cycles because we're re-calculating regions that have already been done.
+
+So can we strike an optimal balance? This is what the `Packer` in this repo tries to do.
 
 ### Steps
-1. Create a version of the global DEM data where for every N degree minute/second subtile we find the highest point. Record that highest point and the subtile's lon/lat.
-2. For each subtile:
-  1. Create a bounding box representing a Total Viewshed calculable tile that fits the highest elevation of all the subtiles it covers.
-  2. The bound should have a minimum overlap of the regions outside any subtiles, therefore basically it should contain a minimum amount of ocean.
-  3. The tile should have a minimum overlap with other tiles.
-3. Move on to the next subtile. If it's already been covered by a previous increased tile then move on.
-4. Score the final tile based on tile overlaps and going outside the subtiles. Hopefully this is all fast enough that we can brute force a low score. How to change the starting conditions?
+1. Create a "lower" resolution version of the global elevation data that for every N degrees/minutes/seconds creates subtile that captures the highest point within itself. So it's lower resolution but it hasn't lost any critical data via the conventional side effects of interpolation. These subtiles are like an accelerating data structure for all the lookups we'll be doing to build the tiles.
+2. For each subtile on a popable stack:
+  1. Create a tile that fits the highest elevation of all the subtiles it covers.
+  2. If the tile overlaps with any other tiles move on to the next subtile.
+  3. Remove all the subtiles from the stack that the tile covers.
+  4. Repeat this process until no more non-overlapping tiles can be found.
+3. Repeat step 2 but allow for overlapping tiles.
+4. Once all subtiles are covered, run some cleanup, like removing tiles that are already encompassed by larger tiles.
 
-### Theoretical longest lines of site based on highest points
-These values are for 2 peaks of the given height and the maximum distance that they could see each other:
-* 8848m 670km
-* 8km   638km
-* 7km   597km
-* 6km   553km
-* 5km   504km
-* 4km   452km
-* 3km   391km
-* 2km   319km
-* 1km   226km
-* 0.5   160km
-* 0     9km
-
-Formula: √(2 * 6,371 * height) * 2
-
-## Assumptions
-PostGIS's WGS84 (SRID 4326) projection uses the EGM96 revisions. See: https://en.wikipedia.org/wiki/World_Geodetic_System
-_
