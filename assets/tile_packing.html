@@ -4,9 +4,8 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Leaflet GeoJSON Tiles</title>
+  <title>Tile Packing For Longest Line Of Sight</title>
 
-  <!-- Leaflet CSS -->
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
 
   <style>
@@ -26,20 +25,16 @@
 <body>
   <div id="map"></div>
 
-  <!-- Leaflet JS -->
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
 
   <script>
-    // Basic map
     const map = L.map('map').setView([0, 0], 2);
 
-    // Basemap
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 19,
       attribution: '&copy; OpenStreetMap contributors'
     }).addTo(map);
 
-    // Styling function for GeoJSON features (AABB tiles as polygons)
     function tileStyle(feature) {
       return {
         color: '#2b8cbe',
@@ -49,7 +44,6 @@
       };
     }
 
-    // Optional label: shows feature.properties.id or index
     function onEachFeature(feature, layer) {
       const id = feature?.properties?.id ?? feature?.properties?.tile ?? null;
       if (id != null) {
@@ -63,12 +57,10 @@
           L.marker(center, { icon: label, interactive: false }).addTo(map);
         }
       }
-      // popup with raw props
       layer.bindPopup(`<pre>${JSON.stringify(feature.properties || {}, null, 2)}</pre>`, { maxHeight: 200 });
     }
 
-    // Fetch GeoJSON from local static path
-    fetch('/static/tiles.json')
+    fetch('tiles.json')
       .then(res => {
         if (!res.ok) throw new Error('Failed to fetch tiles.json: ' + res.status);
         return res.json();
@@ -79,7 +71,6 @@
           onEachFeature: onEachFeature
         }).addTo(map);
 
-        // Fit to data if available
         if (layer.getBounds && !layer.getBounds().isValid()) {
           console.warn('GeoJSON layer has no valid bounds.');
         } else if (layer.getBounds) {
@@ -101,4 +92,3 @@
   </script>
 </body>
 </html>
-
