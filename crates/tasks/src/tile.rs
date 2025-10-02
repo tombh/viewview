@@ -1,16 +1,16 @@
 //! A single computable tile for the Total Viewshed algorithm.
 
 use color_eyre::{Result, eyre::ContextCompat as _};
-use geo::{BoundingRect as _, GeodesicArea as _, polygon};
+use geo::{Area as _, BoundingRect as _, polygon};
 use rstar::PointDistance as _;
 
-use crate::projector::LatLonCoord;
+use crate::projector::LonLatCoord;
 
 /// The tile data itself.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tile {
     /// The centre of the tile.
-    pub centre: crate::projector::LatLonCoord,
+    pub centre: crate::projector::LonLatCoord,
     /// The width of the tile. Therefore, not the distance from the centre to an edge.
     pub width: f32,
 }
@@ -22,7 +22,7 @@ impl Tile {
     }
 
     /// The centre coordinate reprojected to the given metric projection.
-    pub fn centre_metric(&self, anchor: crate::projector::LatLonCoord) -> Result<geo::Coord> {
+    pub fn centre_metric(&self, anchor: crate::projector::LonLatCoord) -> Result<geo::Coord> {
         let projecter = crate::projector::Convert { base: anchor };
         projecter.to_meters(self.centre)
     }
@@ -33,10 +33,10 @@ impl Tile {
     fn to_bbox_lonlat(
         self,
     ) -> Result<(
-        crate::projector::LatLonCoord,
-        crate::projector::LatLonCoord,
-        crate::projector::LatLonCoord,
-        crate::projector::LatLonCoord,
+        crate::projector::LonLatCoord,
+        crate::projector::LonLatCoord,
+        crate::projector::LonLatCoord,
+        crate::projector::LonLatCoord,
     )> {
         let projecter = crate::projector::Convert { base: self.centre };
         let offset = self.offset();
@@ -52,33 +52,29 @@ impl Tile {
     /// just exactly the same as the tile itself. Perhaps there's a better name to use?
     fn to_bbox_metric(
         self,
-        anchor: crate::projector::LatLonCoord,
+        anchor: crate::projector::LonLatCoord,
     ) -> Result<(geo::Coord, geo::Coord, geo::Coord, geo::Coord)> {
         let bbox_lonlat = self.to_bbox_lonlat()?;
 
-        let anchor_projector = crate::projector::Convert { base: anchor };
+        let projector = crate::projector::Convert { base: anchor };
         Ok((
-            anchor_projector.to_meters(bbox_lonlat.0)?,
-            anchor_projector.to_meters(bbox_lonlat.1)?,
-            anchor_projector.to_meters(bbox_lonlat.2)?,
-            anchor_projector.to_meters(bbox_lonlat.3)?,
+            projector.to_meters(bbox_lonlat.0)?,
+            projector.to_meters(bbox_lonlat.1)?,
+            projector.to_meters(bbox_lonlat.2)?,
+            projector.to_meters(bbox_lonlat.3)?,
         ))
     }
 
-    /// The Axis-Aligned Bounding Box for the tile. Note that this has an unintuitive shape. The
-    /// metric projection's 0,0 coord is still at a "polar" point, therefore axis-alignment rarely
-    /// follows the axes of the tile. Nevertheless the AABB is still useful for quicker first pass
-    /// lookups of containing points. A follow up `is_within()` for each found point can then be
-    /// used to get the exact contents.
-    pub fn to_aabb_metric(
-        self,
-        anchor: crate::projector::LatLonCoord,
-    ) -> Result<rstar::AABB<geo::Coord>> {
+    /// The Axis-Aligned Bounding Box for the tile. Note that this has an unintuitive shape as
+    /// "axis-alighed" in lon/lat coordinates are very much not squares near the poles.
+    /// Nevertheless the AABB is still useful for quicker first pass lookups of containing points.
+    /// A follow up `is_within()` for each found point can then be used to get the exact contents.
+    pub fn to_aabb_lonlat(self) -> Result<rstar::AABB<LonLatCoord>> {
         let bbox = self
-            .to_polygon_metric(anchor)?
+            .to_polygon_lonlat()?
             .bounding_rect()
             .context(format!("Couldn't find bbox for tile: {self:?}"))?;
-        let aabb = rstar::AABB::from_corners(bbox.min(), bbox.max());
+        let aabb = rstar::AABB::from_corners(LonLatCoord(bbox.min()), LonLatCoord(bbox.max()));
 
         Ok(aabb)
     }
@@ -90,24 +86,24 @@ impl Tile {
     }
 
     /// Metric polygon of tile.
-    pub fn to_polygon_metric(self, anchor: crate::projector::LatLonCoord) -> Result<geo::Polygon> {
+    pub fn to_polygon_metric(self, anchor: crate::projector::LonLatCoord) -> Result<geo::Polygon> {
         let bbox = self.to_bbox_metric(anchor)?;
         Ok(polygon![bbox.0, bbox.1, bbox.2, bbox.3, bbox.0])
     }
 
     /// The surface area covered by the tile.
     pub fn surface_area(self) -> Result<f32> {
-        let polygon = self.to_polygon_lonlat()?;
+        let polygon = self.to_polygon_metric(self.centre)?;
         #[expect(
             clippy::as_conversions,
             clippy::cast_possible_truncation,
             reason = "Is there another way?"
         )]
-        Ok(polygon.geodesic_area_unsigned() as f32)
+        Ok(polygon.unsigned_area() as f32)
     }
 
     /// Calculate the distance in meters of the tile from the given point.
-    pub fn distance_from(&self, point_lonlat: LatLonCoord) -> Result<f64> {
+    pub fn distance_from(&self, point_lonlat: LonLatCoord) -> Result<f64> {
         let projector = crate::projector::Convert { base: point_lonlat };
         let point = projector.to_meters(self.centre)?;
 

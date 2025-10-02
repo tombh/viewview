@@ -23,7 +23,7 @@ use clap::Parser as _;
 use color_eyre::Result;
 use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
-use crate::projector::LatLonCoord;
+use crate::projector::LonLatCoord;
 
 /// The file name for the max subtiles data.
 const SUBTILES_FILE: &str = "max_subtiles.bin";
@@ -38,7 +38,7 @@ fn main() -> Result<()> {
         crate::config::Commands::Packer(packer_config) => {
             let mut packer = packer::Packer::new(packer_config.clone())?;
             match packer_config.one {
-                Some(coordinate) => packer.run_one(LatLonCoord(geo::coord! {
+                Some(coordinate) => packer.run_one(LonLatCoord(geo::coord! {
                     x: coordinate.0,
                     y: coordinate.1
                 }))?,

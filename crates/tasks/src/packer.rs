@@ -8,11 +8,11 @@
 
 use std::{collections::VecDeque, panic};
 
-use color_eyre::Result;
-use geo::{BooleanOps as _, Contains as _, GeodesicArea as _, Intersects as _, Within as _};
+use color_eyre::{Result, eyre::ContextCompat as _};
+use geo::{Area as _, BooleanOps as _, Contains as _, Intersects as _, Within as _};
 use rstar::PointDistance as _;
 
-use crate::projector::LatLonCoord;
+use crate::projector::LonLatCoord;
 
 /// The minimum elevation inside a tile to start considering larger tiles from. Another way of
 /// looking at this is rather the minimum _width_ of tile, as tile widths are primarilly dictated
@@ -35,9 +35,9 @@ const WINDOW_STEP: f64 = WINDOW_RADIUS / 2.0f64;
 
 /// A single point of elevation that represents the highest elevation within the resolution range of
 /// the point. The resolution is defined by another process, `max_subtile.rs`.
-type ElevationRstar = rstar::primitives::GeomWithData<geo::Coord, i32>;
+type PointRstar = rstar::primitives::GeomWithData<LonLatCoord, i32>;
 /// How we store tiles for fast lookups.
-type TileRstar = rstar::primitives::GeomWithData<geo::Coord, crate::tile::Tile>;
+type TileRstar = rstar::primitives::GeomWithData<LonLatCoord, crate::tile::Tile>;
 
 /// A packer of tiles.
 pub struct Packer {
@@ -45,31 +45,21 @@ pub struct Packer {
     config: crate::config::Packer,
     /// For projecting between different coordinate systems. There are 3:
     ///   1. Conventional lon/lat.
-    ///   2. AEQD anchored to the centre of the current packing "window". An expensive part of the
-    ///      packer is finding all the elevations within a tile. Ideally we would reproject all
-    ///      the millions of elevations to be anchored on the tile, but I think as long as the
-    ///      current window is within a reasonable distance, say 2000km, then there isn't a
-    ///      significant loss of accuracy.
-    ///      
-    ///      TODO:
-    ///      First, find out what the error margin is. And then if it is a problem, explore
-    ///      using a lon/lat AABB to find a reduced set of points that can be reprojected to the
-    ///      tile's centre.
+    ///   2. AEQD anchored to the centre of the current packing "window". This is mostly just for
+    ///      defining the extent of points and tiles that get handled at a time.
     ///   3. AEQD anchored to the cnetre of a given tile. This is necessary for things like
     ///      constructing the tile's actual corners. The simple act of adding a distance to a point
     ///      must be done in as local as possible projection.
     projector: crate::projector::Convert,
     /// An unchanging canonical reference of all the world's maximum elevation points.
-    canonical: rstar::RTree<ElevationRstar>,
-    /// The window is a view onto a more manageable subset of the canonical data. It is mainly for
-    /// faster lookups but also helps with projection accuracy.
-    window: rstar::RTree<ElevationRstar>,
+    canonical: rstar::RTree<PointRstar>,
     /// A stack of points, each of which must at some point be proven to fall within a tile.
-    stack: VecDeque<ElevationRstar>,
-    /// All the currently found tiles for the _window_.
+    stack: VecDeque<PointRstar>,
+    /// Keep track of all the points that we've contained by tiles. Useful for not repeating points
+    /// in later windows.
+    stack_history: rstar::RTree<PointRstar>,
+    /// All the currently found tiles for the world.
     tiles: rstar::RTree<TileRstar>,
-    /// All the currently found tiles for the _world_.
-    all: rstar::RTree<TileRstar>,
 }
 
 impl Packer {
@@ -78,12 +68,13 @@ impl Packer {
         Ok(Self {
             config,
             canonical: Self::build_canonical_rtree()?,
-            window: rstar::RTree::new(),
+            // window: rstar::RTree::new(),
+            stack_history: rstar::RTree::new(),
             stack: VecDeque::new(),
+            // tiles: rstar::RTree::new(),
             tiles: rstar::RTree::new(),
-            all: rstar::RTree::new(),
             projector: crate::projector::Convert {
-                base: crate::projector::LatLonCoord(geo::Coord::zero()),
+                base: crate::projector::LonLatCoord(geo::Coord::zero()),
             },
         })
     }
@@ -91,7 +82,7 @@ impl Packer {
     /// Run for the entire globe.
     pub fn run_all(&mut self) -> Result<()> {
         let default_start = (-180.0f64, 90.0f64);
-        let mut centre = LatLonCoord(self.config.start.unwrap_or(default_start).into());
+        let mut centre = LonLatCoord(self.config.start.unwrap_or(default_start).into());
 
         let mut steps = 0u32;
         while (-90.0f64..=90.0f64).contains(&centre.0.y) {
@@ -114,14 +105,13 @@ impl Packer {
 
                 self.run_one(centre)?;
                 self.nudge_extend_window_tiles()?;
-                self.move_tiles_to_all()?;
                 self.remove_inefficient_tiles()?;
                 self.save_tiles_as_geojson()?;
                 if is_last_longitude {
                     break;
                 }
 
-                centre = LatLonCoord(geo::coord! {
+                centre = LonLatCoord(geo::coord! {
                     x: centre.0.x + longtitude_step,
                     y: centre.0.y
                 });
@@ -133,19 +123,12 @@ impl Packer {
 
                 steps += 1;
             }
-            centre = Self::start_new_latitude(centre)?;
+            let Some(updated_centre) = Self::start_new_latitude(centre)? else {
+                break;
+            };
+            centre = updated_centre;
         }
 
-        Ok(())
-    }
-
-    /// Move tiles generated in a window to the global store.
-    fn move_tiles_to_all(&mut self) -> Result<()> {
-        for tile in &self.tiles {
-            let tile_lonlat = TileRstar::new(self.projector.to_degrees(*tile.geom())?.0, tile.data);
-            self.all.insert(tile_lonlat);
-        }
-        self.tiles = rstar::RTree::new();
         Ok(())
     }
 
@@ -156,18 +139,22 @@ impl Packer {
     }
 
     /// Do a sort of "carriage return" to the next latitude South.
-    fn start_new_latitude(current: LatLonCoord) -> Result<LatLonCoord> {
+    fn start_new_latitude(current: LonLatCoord) -> Result<Option<LonLatCoord>> {
         let projector = crate::projector::Convert { base: current };
         let down = projector.to_degrees(geo::coord! {
             x: 0.0f64,
             y: -WINDOW_STEP,
         })?;
-        Ok(LatLonCoord((-180.0, down.0.y).into()))
+        let updated = LonLatCoord((-180.0f64, down.0.y).into());
+        if updated.0.y >= current.0.y {
+            return Ok(None);
+        }
+        Ok(Some(updated))
     }
 
     /// Run a single step.
-    pub fn run_one(&mut self, centre: LatLonCoord) -> Result<()> {
-        self.build_window(centre);
+    pub fn run_one(&mut self, centre: LonLatCoord) -> Result<()> {
+        self.build_window(centre)?;
         self.iterate()?;
 
         if self.config.one.is_some() {
@@ -179,57 +166,66 @@ impl Packer {
         Ok(())
     }
 
-    /// Build a view onto a subset of the total data. This primarily allows for faster lookups of
-    /// relevant data, and also hopefully adds a bit to the accuracy as all points in the window
-    /// are projected to an AEQD projection anchored on the centre of the window.
-    fn build_window(&mut self, centre: LatLonCoord) {
-        let mut window = Vec::new();
+    /// Build a view onto a subset of the total data.
+    fn build_window(&mut self, centre: LonLatCoord) -> Result<()> {
         self.stack = VecDeque::new();
         self.projector = crate::projector::Convert { base: centre };
 
         tracing::debug!("Ordering around coordinate: {centre:?}");
-        for canonical_point in self.canonical.nearest_neighbor_iter(&centre.0) {
-            let lonlat = crate::projector::LatLonCoord(*canonical_point.geom());
-            #[expect(clippy::panic, reason = "This should be considered a bug.")]
-            let projected = self
-                .projector
-                .to_meters(lonlat)
-                .unwrap_or_else(|_| panic!("Couldn't project point: {lonlat:?}"));
-            let height = canonical_point.data;
-            let point = ElevationRstar::new(projected, height);
-            window.push(point);
-
-            let distance = point.geom().distance_2(&geo::Coord::zero()).sqrt();
-            if distance < WINDOW_STEP {
-                self.stack.push_back(point);
+        for canonical_point in self.canonical.nearest_neighbor_iter(&centre) {
+            let projected = self.projector.to_meters(*canonical_point.geom())?;
+            let is_new_point = !self.stack_history.contains(canonical_point);
+            let distance = projected.distance_2(&geo::Coord::zero()).sqrt();
+            if distance < WINDOW_STEP && is_new_point {
+                self.stack.push_back(*canonical_point);
+                self.stack_history.insert(*canonical_point);
             }
             if distance > WINDOW_RADIUS {
                 break;
             }
         }
 
-        // TODO: remember to also reproject the tile RTree when moving the window.
+        Ok(())
+    }
 
-        self.window = rstar::RTree::bulk_load(window);
+    /// Get just the tiles in the current window.
+    fn tiles_in_window(&self) -> Result<Vec<TileRstar>> {
+        let mut tiles = Vec::new();
+        let iterator = self
+            .tiles
+            .nearest_neighbor_iter(&self.current_window_centre());
+
+        for tile in iterator {
+            let distance = self
+                .projector
+                .to_meters(*tile.geom())?
+                .distance_2(&geo::Coord::zero())
+                .sqrt();
+            if distance > WINDOW_RADIUS {
+                break;
+            }
+            tiles.push(*tile);
+        }
+
+        Ok(tiles)
     }
 
     /// The centre of the current window.
-    const fn current_window_centre(&self) -> LatLonCoord {
+    const fn current_window_centre(&self) -> LonLatCoord {
         self.projector.base
     }
 
     /// Load the acceleration structire of maximum elevation subtiles for the whole world.
-    fn build_canonical_rtree() -> Result<rstar::RTree<ElevationRstar>> {
-        let mut points: Vec<ElevationRstar> = Vec::new();
+    fn build_canonical_rtree() -> Result<rstar::RTree<PointRstar>> {
+        let mut points: Vec<PointRstar> = Vec::new();
         // TODO: make the file name configurable.
         let subtiles = crate::max_subtile::Subtiler::load("max_subtiles.bin")?;
         let total_points = subtiles.len();
 
         tracing::info!("Loading {} max subtiles.", total_points);
         for subtile in subtiles {
-            // TODO: should this be using the LonLatCoord type?
-            points.push(ElevationRstar::new(
-                geo::coord! { x: subtile.lon.into(), y: subtile.lat.into()},
+            points.push(PointRstar::new(
+                LonLatCoord(geo::coord! { x: subtile.lon.into(), y: subtile.lat.into()}),
                 subtile.max_height,
             ));
         }
@@ -245,8 +241,8 @@ impl Packer {
 
     /// Loop over all the points in a window.
     fn iterate(&mut self) -> Result<()> {
-        let original_points: Vec<ElevationRstar> = self.stack.clone().into();
-        let mut zeroes = Vec::new();
+        let original_points: Vec<PointRstar> = self.stack.clone().into();
+        let mut zeroes: Vec<PointRstar> = Vec::new();
         while let Some(point) = self.get_next_point() {
             if point.data <= MINIMUM_HEIGHT {
                 zeroes.push(point);
@@ -266,11 +262,11 @@ impl Packer {
     }
 
     /// Search for the best non-overlapping tile for the given point.
-    fn find_non_overlapping_tile_for_point(&mut self, centre: ElevationRstar) -> Result<()> {
+    fn find_non_overlapping_tile_for_point(&mut self, centre: PointRstar) -> Result<()> {
         tracing::debug!("Finding non-overlapping tile for point: {centre:?}");
         let mut highest = centre;
         loop {
-            let tile = self.find_minimum_tile_for_point(&centre, highest.data)?;
+            let tile = Self::find_minimum_tile_for_point(centre.geom(), highest.data);
             let Some((candidate, covered_points)) = self.find_highest_point_in_tile(&tile)? else {
                 // Ignore tiles with just zeroes in them.
                 return Ok(());
@@ -299,13 +295,13 @@ impl Packer {
     /// Search for the best tile for the given point regardless of other tiles.
     fn find_any_tile_for_point(
         &self,
-        centre: ElevationRstar,
+        point: PointRstar,
         start_with_highest: Option<i32>,
-    ) -> Result<Option<(crate::tile::Tile, Vec<ElevationRstar>)>> {
-        tracing::debug!("Finding any tile for point: {centre:?}");
-        let mut highest = start_with_highest.unwrap_or(centre.data);
+    ) -> Result<Option<(crate::tile::Tile, Vec<PointRstar>)>> {
+        tracing::debug!("Finding any tile for point: {point:?}");
+        let mut highest = start_with_highest.unwrap_or(point.data);
         loop {
-            let tile = self.find_minimum_tile_for_point(&centre, highest)?;
+            let tile = Self::find_minimum_tile_for_point(point.geom(), highest);
             let Some((candidate, covered_points)) = self.find_highest_point_in_tile(&tile)? else {
                 // Ignore tiles with just zeroes in them.
                 return Ok(None);
@@ -325,47 +321,46 @@ impl Packer {
     }
 
     /// Find all the points in a tile.
-    //
-    // TODO: Investigate doing this all in lon/lat. It may save some reprojection.
-    fn find_points_in_tile(
-        &self,
-        tile: &crate::tile::Tile,
-    ) -> Result<Vec<rstar::primitives::GeomWithData<geo::Coord, i32>>> {
-        let tile_polygon = tile.to_polygon_metric(self.current_window_centre())?;
-        let mut covered_points: Vec<ElevationRstar> = self
-            .window
-            .locate_in_envelope_intersecting(&tile.to_aabb_metric(self.current_window_centre())?)
+    fn find_points_in_tile(&self, tile: &crate::tile::Tile) -> Result<Vec<PointRstar>> {
+        let tile_polygon = tile.to_polygon_lonlat()?;
+        let mut covered_points: Vec<PointRstar> = self
+            .canonical
+            .locate_in_envelope_intersecting(&tile.to_aabb_lonlat()?)
             .copied()
             .collect();
-        covered_points.retain(|point| point.geom().is_within(&tile_polygon));
+        covered_points.retain(|point| point.geom().0.is_within(&tile_polygon));
         Ok(covered_points)
     }
 
     /// Calculate how much a tile overlaps with its neighbours.
     fn calculate_overlap_amount(&self, tile: &crate::tile::Tile) -> Result<f64> {
-        let candidate = tile.to_polygon_lonlat()?;
-        let area = candidate.geodesic_area_unsigned();
-        let mut overlap = 0.0f64;
+        let candidate_polygon = tile.to_polygon_lonlat()?;
+        let area = candidate_polygon.unsigned_area();
         let mut searched = 0usize;
-        for neighbour_basic in self.tiles.nearest_neighbor_iter(&tile.centre.0) {
-            let neighbour = neighbour_basic.data.to_polygon_lonlat()?;
-            let intersection = candidate.intersection(&neighbour);
-            overlap += intersection.geodesic_area_unsigned();
+        let mut super_tile = geo::MultiPolygon::empty();
+        let iterator = self.tiles.nearest_neighbor_iter(&tile.centre);
+        for neighbour in iterator {
+            if &neighbour.data == tile {
+                continue;
+            }
+            let neighbour_polygon = neighbour.data.to_polygon_lonlat()?;
+            if neighbour_polygon.intersects(&candidate_polygon) {
+                super_tile = super_tile.union(&neighbour_polygon);
+            }
             searched += 1;
-            if searched > 1000 {
+            if searched > 50 {
                 break;
             }
         }
+
+        let overlap = candidate_polygon.intersection(&super_tile).unsigned_area();
         Ok(overlap / area)
     }
 
     /// Find points that have not yet been associated with a tile.
-    fn find_underlappers(
-        &self,
-        original_points: Vec<ElevationRstar>,
-    ) -> Result<Vec<ElevationRstar>> {
+    fn find_underlappers(&self, original_points: Vec<PointRstar>) -> Result<Vec<PointRstar>> {
         let mut underlappers = original_points;
-        for tile in &self.tiles {
+        for tile in self.tiles_in_window()? {
             let covered_points = self.find_points_in_tile(&tile.data)?;
             underlappers.retain(|point| !covered_points.contains(point));
         }
@@ -374,7 +369,7 @@ impl Packer {
     }
 
     /// Loop over all points that have not yet been covered by a tile.
-    fn iterate_underlappers(&mut self, original_points: Vec<ElevationRstar>) -> Result<()> {
+    fn iterate_underlappers(&mut self, original_points: Vec<PointRstar>) -> Result<()> {
         let underlappers = self.find_underlappers(original_points)?;
         self.stack = underlappers.into();
 
@@ -391,8 +386,8 @@ impl Packer {
     ///   1. A tile for the point, even though it will overlap another tile.
     ///   2. Find the nearest tile to the underlapping point and extend it to cover the point.
     ///
-    /// And add the one that introduces the least surface area.
-    fn handle_underlapper(&mut self, point: ElevationRstar) -> Result<()> {
+    /// And add the one that introduces the least new surface area.
+    fn handle_underlapper(&mut self, point: PointRstar) -> Result<()> {
         let Some((own_tile, own_covered_points)) = self.find_any_tile_for_point(point, None)?
         else {
             tracing::trace!("No tile found");
@@ -412,18 +407,20 @@ impl Packer {
     /// size of the tile.
     fn attempt_increasing_nearest_tile(
         &mut self,
-        point: ElevationRstar,
+        point: PointRstar,
         surface_area_to_beat: f32,
     ) -> Result<bool> {
         if self.tiles.size() == 0 {
             return Ok(false);
         }
-        let (mut nearest_tile, old_width) = self.engulf_tile_to_point(&point)?;
+        let Some((mut nearest_tile, old_width)) = self.engulf_tile_to_point(&point)? else {
+            return Ok(false);
+        };
         let nearest_tile_starting_surface_area = nearest_tile.data.surface_area()?;
         tracing::trace!("🏝️ Nearest tile for underlapping point ({point:?}): {nearest_tile:?}");
 
-        self.shrink_wrap_tile_to_point(&mut nearest_tile, point)?;
-        let nearest_tile_covered_points = self.ensure_tile_is_big_enough(&mut nearest_tile)?;
+        Self::shrink_wrap_tile_to_point(&mut nearest_tile, point)?;
+        let nearest_tile_covered_points = self.ensure_tile_is_big_enough(&nearest_tile)?;
 
         let nearest_tile_surface_increase =
             nearest_tile.data.surface_area()? - nearest_tile_starting_surface_area;
@@ -435,10 +432,6 @@ impl Packer {
             "Changed nearest tile's width: {old_width} to {}",
             nearest_tile.data.width
         );
-        assert!(
-            nearest_tile.data.width > old_width,
-            "Resized tile didn't increase in size, probably a bug."
-        );
 
         self.tiles.pop_nearest_neighbor(point.geom());
         self.add_tile(nearest_tile.data, &nearest_tile_covered_points)?;
@@ -446,10 +439,11 @@ impl Packer {
     }
 
     /// Increase a tile's width such that it contains the given point.
-    ///
-    /// Overshoots to ensure no false positives between projection changes.
-    fn engulf_tile_to_point(&self, point: &ElevationRstar) -> Result<(TileRstar, f32)> {
+    fn engulf_tile_to_point(&self, point: &PointRstar) -> Result<Option<(TileRstar, f32)>> {
+        // Some magic to make sure the tile overlaps the point. Not sure why this is needed?
+        // Something to do with lon/lat projections?
         let overshoot = 1.01;
+
         let Some(nearest_tile_reference) = self.tiles.nearest_neighbor(point.geom()) else {
             color_eyre::eyre::bail!("No nearest tile found for point: {point:?}");
         };
@@ -462,30 +456,45 @@ impl Packer {
 
         // Relative distances must be done in a projection anchored to the point where the relative
         // distance begins.
-        let point_lonlat = self.projector.to_degrees(*point.geom())?;
-        let point_anchored_to_tile = tile_projecter.to_meters(point_lonlat)?;
-
-        let distance = point_anchored_to_tile.x.hypot(point_anchored_to_tile.y);
+        let point_anchored_to_tile = tile_projecter.to_meters(*point.geom())?;
+        let distance = point_anchored_to_tile
+            .distance_2(&geo::Coord::zero())
+            .sqrt();
         tracing::trace!("Point is {distance}m from its nearest tile.");
         #[expect(
             clippy::cast_possible_truncation,
             clippy::as_conversions,
             reason = "I think this is the only way?"
         )]
-        let first_width = (distance as f32 * 2.0) * overshoot;
-        nearest_tile.data.width = first_width;
+        let new_width = (distance as f32 * 2.0) * overshoot;
+        nearest_tile.data.width = new_width;
+        if new_width > 700_000.0 {
+            return Ok(None);
+        }
+        let lonlat = point.geom().0;
+        if !lonlat.is_within(&nearest_tile.data.to_polygon_lonlat()?) {
+            tracing::warn!("Nearest tile {nearest_tile:?} can't be fit over point {point:?}");
+            return Ok(None);
+        }
 
-        Ok((nearest_tile, old_width))
+        if nearest_tile.data.width < old_width {
+            tracing::warn!(
+                "Resized tile ({nearest_tile:?}) didn't increase in size ({old_width}), probably a bug."
+            );
+            return Ok(None);
+        }
+
+        Ok(Some((nearest_tile, old_width)))
     }
 
     /// Slowly shrink a tile until we find the last size within which `is_within()` returns true
     /// for the given point.
-    fn shrink_wrap_tile_to_point(&self, tile: &mut TileRstar, point: ElevationRstar) -> Result<()> {
+    fn shrink_wrap_tile_to_point(tile: &mut TileRstar, point: PointRstar) -> Result<()> {
         let first_width = tile.data.width;
         let step = 100.0;
         loop {
-            let polygon = tile.data.to_polygon_metric(self.current_window_centre())?;
-            if !point.geom().is_within(&polygon) {
+            let polygon = tile.data.to_polygon_lonlat()?;
+            if !point.geom().0.is_within(&polygon) {
                 #[expect(
                     clippy::float_cmp,
                     reason = "`first_width` is the original value, not the result of a calculation."
@@ -519,7 +528,7 @@ impl Packer {
           Panicking is better as this is just a one-off script, so its better to just fix the bug.
         "
     )]
-    fn ensure_tile_is_big_enough(&self, tile: &mut TileRstar) -> Result<Vec<ElevationRstar>> {
+    fn ensure_tile_is_big_enough(&mut self, tile: &TileRstar) -> Result<Vec<PointRstar>> {
         let Some((tile_highest, mut tile_covered_points)) =
             self.find_highest_point_in_tile(&tile.data)?
         else {
@@ -530,7 +539,7 @@ impl Packer {
 
         let start_at_height = tile_highest.data;
         let Some((resized_tile, resized_covered_points)) =
-            self.find_any_tile_for_point(ElevationRstar::new(*tile.geom(), start_at_height), None)?
+            self.find_any_tile_for_point(PointRstar::new(tile.data.centre, start_at_height), None)?
         else {
             panic!("We can't recover from this. It's probably a bug");
         };
@@ -539,7 +548,7 @@ impl Packer {
                 "Resized tile was resized _again_ due to containing a higher highest point:"
             );
             tracing::debug!("  From: {}m to {}m", tile.data.width, resized_tile.width,);
-            tile.data.width = resized_tile.width;
+            self.set_tile_width(tile.data.centre, resized_tile.width)?;
             tile_covered_points = resized_covered_points;
         } else {
             tracing::trace!(
@@ -550,16 +559,9 @@ impl Packer {
         Ok(tile_covered_points)
     }
 
-    /// Add a single tile to the list of all tiles that covered the world's land.
-    fn add_tile(
-        &mut self,
-        tile: crate::tile::Tile,
-        covered_points: &[ElevationRstar],
-    ) -> Result<()> {
-        self.tiles.insert(TileRstar::new(
-            tile.centre_metric(self.current_window_centre())?,
-            tile,
-        ));
+    /// Add a tile to the world.
+    fn add_tile(&mut self, tile: crate::tile::Tile, covered_points: &[PointRstar]) -> Result<()> {
+        self.tiles.insert(TileRstar::new(tile.centre, tile));
         tracing::info!("Added tile: {tile:?}");
 
         if self.config.one.is_some() {
@@ -579,22 +581,19 @@ impl Packer {
     }
 
     /// Pop the next point off the stack.
-    fn get_next_point(&mut self) -> Option<ElevationRstar> {
+    fn get_next_point(&mut self) -> Option<PointRstar> {
         self.stack.pop_front()
     }
 
     /// Find the minimum bounding box that would allow calculating all the lines of site based on
     /// how far the highest point can see.
-    fn find_minimum_tile_for_point(
-        &self,
-        point: &ElevationRstar,
-        highest: i32,
-    ) -> Result<crate::tile::Tile> {
+    fn find_minimum_tile_for_point(point: &LonLatCoord, highest: i32) -> crate::tile::Tile {
         let width = Self::minimum_tile_size_for_elevation(highest);
         tracing::trace!("Minimum extent for {point:?}: {width}");
-        let centre = self.projector.to_degrees(*point.geom())?;
-        let tile = crate::tile::Tile { centre, width };
-        Ok(tile)
+        crate::tile::Tile {
+            centre: *point,
+            width,
+        }
     }
 
     /// Given a height, how far is the longest theoretical line of sight from it.
@@ -624,23 +623,24 @@ impl Packer {
     fn find_highest_point_in_tile(
         &self,
         tile: &crate::tile::Tile,
-    ) -> Result<Option<(ElevationRstar, Vec<ElevationRstar>)>> {
+    ) -> Result<Option<(PointRstar, Vec<PointRstar>)>> {
         let start = std::time::Instant::now();
         let mut highest = None;
         let mut covered_points = Vec::new();
 
-        // The AABB is quicker to search within but is also slightly rotated in AEQD projections
-        // so we need a second step to clip points outide of the tile's real extent.
-        let tile_aabb = tile.to_aabb_metric(self.current_window_centre())?;
-        let aabb_points = self.window.locate_in_envelope_intersecting(&tile_aabb);
+        // The AABB is quicker to search within but is also slightly skewed in lon/lat
+        // projections so we need a second step to clip points outside of the tile's real
+        // extent.
+        let tile_aabb = tile.to_aabb_lonlat()?;
+        let aabb_points = self.canonical.locate_in_envelope_intersecting(&tile_aabb);
 
-        let covered_points_polygon = tile.to_polygon_metric(self.current_window_centre())?;
-        let highest_points_polygon = tile.to_polygon_metric(self.current_window_centre())?;
+        let covered_points_polygon = tile.to_polygon_lonlat()?;
 
         let mut current_highest = i32::MIN;
         let mut is_non_zero_detected = false;
+
         for point in aabb_points {
-            if !point.geom().is_within(&highest_points_polygon) {
+            if !point.geom().0.is_within(&covered_points_polygon) {
                 continue;
             }
             if point.data != 0i32 {
@@ -650,9 +650,7 @@ impl Packer {
                 current_highest = point.data;
                 highest = Some(*point);
             }
-            if point.geom().is_within(&covered_points_polygon) {
-                covered_points.push(*point);
-            }
+            covered_points.push(*point);
         }
 
         if !is_non_zero_detected {
@@ -679,61 +677,37 @@ impl Packer {
 
     /// Remove any tiles that are completely covered by other tiles.
     fn remove_inefficient_tiles(&mut self) -> Result<()> {
-        let mut discarders = Vec::new();
-        let mut keepers = Vec::new();
-        let source = match self.config.one {
-            Some(_) => &self.tiles,
-            None => &self.all,
-        };
-        tracing::info!("Removing nested tiles from {} tiles...", source.size());
+        let mut cleaned = self.tiles.clone();
+        let window_tiles = self.tiles_in_window()?;
+        tracing::info!("Removing nested tiles from {} tiles...", window_tiles.len());
 
-        for tile in source {
-            if discarders.contains(tile) {
+        for tile in window_tiles {
+            if !cleaned.contains(&tile) {
                 continue;
             }
 
-            let distance = tile.data.distance_from(self.current_window_centre())?;
-            if distance > WINDOW_RADIUS * 1.5f64 {
-                keepers.push(*tile);
+            if Self::is_tile_nested(&tile, &cleaned)? {
+                cleaned.remove(&tile);
                 continue;
             }
 
-            if self.is_tile_nested(tile, &discarders)? {
-                discarders.push(*tile);
-            } else {
-                keepers.push(*tile);
-            }
+            self.find_better_bigger_neighbour(&tile, &mut cleaned)?;
         }
 
-        let count = match self.config.one {
-            Some(_) => {
-                self.tiles = rstar::RTree::bulk_load(keepers.clone());
-                self.tiles.size() - keepers.len()
-            }
-            None => {
-                self.all = rstar::RTree::bulk_load(keepers.clone());
-                self.all.size() - keepers.len()
-            }
-        };
+        let size = self.tiles.size() - cleaned.size();
+        self.tiles = cleaned;
 
-        tracing::info!("Removed {count} nested tiles.");
+        tracing::info!("Removed {size} nested tiles.");
         Ok(())
     }
 
     /// Is the tile completely inside another tile?
-    fn is_tile_nested(&self, tile: &TileRstar, discarders: &[TileRstar]) -> Result<bool> {
-        let source = match self.config.one {
-            Some(_) => &self.tiles,
-            None => &self.all,
-        };
+    fn is_tile_nested(tile: &TileRstar, cleaned: &rstar::RTree<TileRstar>) -> Result<bool> {
         let polygon = tile.data.to_polygon_lonlat()?;
         let mut super_tile = geo::MultiPolygon::empty();
-        let iterator = source.nearest_neighbor_iter(tile.geom()).enumerate();
+        let iterator = cleaned.nearest_neighbor_iter(tile.geom()).enumerate();
         for (count, neighbour) in iterator {
             if neighbour == tile {
-                continue;
-            }
-            if discarders.contains(neighbour) {
                 continue;
             }
             if count > 50 {
@@ -749,17 +723,152 @@ impl Packer {
         Ok(super_tile.contains(&polygon))
     }
 
-    /// Where the source of completed tiles are.
-    const fn source_of_tiles(
-        &self,
-    ) -> &rstar::RTree<rstar::primitives::GeomWithData<geo::Coord, crate::tile::Tile>> {
-        match self.config.one {
-            Some(_) => &self.tiles,
-            None => &self.all,
+    /// For any tile that has over 50% overlap with other tiles, search to find a nearby tile that
+    /// could be increased in size such that the increase of its surface area is less than the
+    /// overly overlapped tile.
+    fn find_better_bigger_neighbour(
+        &mut self,
+        tile: &TileRstar,
+        tiles: &mut rstar::RTree<TileRstar>,
+    ) -> Result<()> {
+        let minimum_overlap = 0.5f64;
+        let allowed_surface_increase = 1.5;
+        let overlap = self.calculate_overlap_amount(&tile.data)?;
+        if overlap < minimum_overlap {
+            return Ok(());
+        }
+        tracing::trace!("Looking for better bigger neighbouring tile for: {tile:?}");
+
+        let Some(best) = Self::find_betterest_bigger_candidate(tile, tiles)? else {
+            return Ok(());
+        };
+        self.nudge_extend_tile(&best)?;
+
+        let original_surface_area = tiles
+            .locate_at_point(best.geom())
+            .context("Couldn't find tile in cloned RTree, probably a bug")?
+            .data
+            .surface_area()?;
+        let surface_area_increase = best.data.surface_area()? - original_surface_area;
+        let tile_surface_area = tile.data.surface_area()?;
+        if surface_area_increase <= tile_surface_area * allowed_surface_increase {
+            let winner = tiles
+                .locate_at_point_mut(best.geom())
+                .context("Couldn't find tile in cloned RTree, probably a bug")?;
+            winner.data.width = best.data.width;
+            tracing::debug!(
+                "Better bigger neighbouring tile found ({surface_area_increase}m² \
+                vs {tile_surface_area}m²): {winner:?}. Old: {tile:?}"
+            );
+            tiles
+                .remove_at_point(tile.geom())
+                .context("Couldn't remove updated tile")?;
+        } else {
+            tracing::trace!(
+                "No better bigger neighbouring tile that doesn't increase total \
+                surface area found for: {tile:?}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Find the best candidate for replacing a tile with a bigger better neighbour.
+    fn find_betterest_bigger_candidate(
+        tile: &TileRstar,
+        tiles: &rstar::RTree<TileRstar>,
+    ) -> Result<Option<TileRstar>> {
+        let mut candidates = Vec::new();
+        let iterator = tiles.nearest_neighbor_iter(tile.geom()).enumerate();
+        let polygon = tile.data.to_polygon_lonlat()?;
+        for (count, neighbour) in iterator {
+            if neighbour == tile {
+                continue;
+            }
+            if count > 10 {
+                break;
+            }
+            if tile.data.width > neighbour.data.width {
+                continue;
+            }
+
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::as_conversions,
+                reason = "I think this is the only way?"
+            )]
+            let distance = tile.data.distance_from(neighbour.data.centre)? as f32;
+            let starting_width = distance + tile.data.width;
+
+            // TODO: It's weird that we have to loop even bigger. Just calculating the distance
+            // should be enough.
+            let mut bigger = *neighbour;
+            bigger.data.width = starting_width;
+            for _ in 0..3000u32 {
+                if bigger.data.width > 700_000.0 {
+                    break;
+                }
+                if bigger.data.to_polygon_lonlat()?.contains(&polygon) {
+                    candidates.push(bigger);
+                    break;
+                }
+                bigger.data.width += 100.0;
+            }
+        }
+
+        candidates.sort_by(Self::compare_tile_surface_areas);
+
+        match candidates.first() {
+            Some(best) => Ok(Some(*best)),
+            None => {
+                tracing::trace!(
+                    "Not even a candidate better bigger neighbouring tile found for: {tile:?}"
+                );
+                Ok(None)
+            }
         }
     }
 
+    /// Compare the surface areas of 2 tiles.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "Any of these would be a bug. So let's clippy-ignore them all in one place"
+    )]
+    fn compare_tile_surface_areas(left: &TileRstar, right: &TileRstar) -> std::cmp::Ordering {
+        left.data
+            .surface_area()
+            .unwrap()
+            .partial_cmp(&right.data.surface_area().unwrap())
+            .unwrap()
+    }
+
     /// Extend each tile by the resolution of the underlying max subtile data.
+    fn nudge_extend_window_tiles(&mut self) -> Result<()> {
+        let window_tiles = self.tiles_in_window()?;
+        tracing::info!(
+            "Nudge extending tiles ({}) in window to ensure they overlap.",
+            window_tiles.len()
+        );
+
+        for window_tile in window_tiles {
+            self.nudge_extend_tile(&window_tile)?;
+        }
+
+        Ok(())
+    }
+
+    /// Update the width of a tile.
+    fn set_tile_width(&mut self, centre: LonLatCoord, width: f32) -> Result<()> {
+        let canonical_tile = self
+            .tiles
+            .locate_at_point_mut(&centre)
+            .context("Couldn't find tile in canonical store.")?;
+        canonical_tile.data.width = width;
+
+        Ok(())
+    }
+
+    /// Extend the tile by the resolution of the underlying max subtile data.
     ///
     /// Consider the case where 2 tiles perfectly align in the sense that one starts at the next
     /// row or column of points where the adjacent tile finished. This would mean that there is gap
@@ -767,47 +876,47 @@ impl Packer {
     /// based so the actual metric distance varies by latitude. And couple that with the fact that
     /// tiles have to be perfectly square, we can't just increase problematic tile edges by a
     /// constant amount.
-    fn nudge_extend_window_tiles(&mut self) -> Result<()> {
-        tracing::info!(
-            "Nudge extending tiles ({}) in window to ensure they overlap.",
-            self.tiles.size()
-        );
-
+    fn nudge_extend_tile(&mut self, tile: &TileRstar) -> Result<()> {
         // This depends on the resolution set in the max-subtile pre-process step. It's not good
         // that we hardcode it here :/
         let subtile_resolution = 10.0;
-        // Just add a little more for safe measure. Thought the better aproach would be to take the
+        // Just add a little more for safe measure. Though the better aproach would be to take the
         // latitude of the tile corner that is furthest from the equator.
-        let magic = 1.5;
-
-        let mut tiles = Vec::new();
-        for mut tile in self.tiles.iter().copied() {
-            let latitude = tile.data.centre.0.y;
-            let extension = (crate::projector::Convert::meters_per_degree(latitude)
-                / subtile_resolution)
-                * magic;
-            tile.data.width += extension;
-            tiles.push(tile);
-            self.ensure_tile_is_big_enough(&mut tile)?;
-        }
-
-        self.tiles = rstar::RTree::bulk_load(tiles);
+        let magic = 2.0;
+        let latitude = tile.data.centre.0.y;
+        let extension =
+            (crate::projector::Convert::meters_per_degree(latitude) / subtile_resolution) * magic;
+        let new_width = tile.data.width + extension;
+        self.set_tile_width(tile.data.centre, new_width)?;
+        self.ensure_tile_is_big_enough(tile)?;
 
         Ok(())
     }
 
     /// Save the tiles to [`GeoJSON`].
     fn save_tiles_as_geojson(&self) -> Result<()> {
-        let mut features: Vec<geo::Geometry> = Vec::new();
+        let mut features: Vec<geojson::Feature> = Vec::new();
         let path = "static/tiles.json";
-        for tile in self.source_of_tiles() {
-            let geojson_tile = tile.data.to_polygon_lonlat()?;
-            features.push(geojson_tile.into());
+        for tile in &self.tiles {
+            let geometry: geo::Geometry = tile.data.to_polygon_lonlat()?.into();
+            let json: geojson::Geometry = geojson::Geometry::from(&geometry);
+            let mut properties = geojson::JsonObject::new();
+            let point: geojson::Value = (&geo::Point::from(tile.geom().0)).into();
+            properties.insert("centre".into(), (&point).into());
+            properties.insert("width".into(), tile.data.width.into());
+            let feature = geojson::Feature {
+                bbox: None,
+                geometry: Some(json),
+                id: None,
+                properties: Some(properties),
+                foreign_members: None,
+            };
+
+            features.push(feature);
         }
 
-        tracing::info!("Saving {} tiles to: {path}", self.source_of_tiles().size());
-        let feature_collection = geojson::FeatureCollection::from(&features.into());
-        let json = geojson::GeoJson::from(feature_collection);
+        tracing::info!("Saving {} tiles to: {path}", self.tiles.size());
+        let json = geojson::GeoJson::from(features);
         std::fs::write(path, json.to_string())?;
 
         Ok(())
@@ -815,19 +924,14 @@ impl Packer {
 
     /// Save tiles and points [`GeoJSON`].
     #[expect(dead_code, reason = "Useful for debugging.")]
-    fn save_tiles_and_points(
-        maybe_tiles: Option<Vec<crate::tile::Tile>>,
-        points: &[LatLonCoord],
-    ) -> Result<()> {
+    fn save_tiles_and_points(tiles: &[crate::tile::Tile], points: &[LonLatCoord]) -> Result<()> {
         let mut features: Vec<geo::Geometry> = Vec::new();
 
         let path = "static/tiles.json";
 
-        if let Some(tiles) = maybe_tiles.clone() {
-            for tile in tiles {
-                let geojson_tile = tile.to_polygon_lonlat()?;
-                features.push(geojson_tile.into());
-            }
+        for tile in tiles {
+            let geojson_tile = tile.to_polygon_lonlat()?;
+            features.push(geojson_tile.into());
         }
 
         let mut geojson_points = Vec::new();
@@ -841,7 +945,7 @@ impl Packer {
 
         tracing::info!(
             "DEBUG: saving {} tiles and {} points to: {path}",
-            maybe_tiles.unwrap_or_default().len(),
+            tiles.len(),
             points.len()
         );
         let json = geojson::GeoJson::from(feature_collection);

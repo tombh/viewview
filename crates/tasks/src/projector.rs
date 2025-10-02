@@ -7,12 +7,41 @@ pub const EARTH_RADIUS: f32 = 6371.0;
 
 /// A latitude/longtitude coordinate.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Default)]
-pub struct LatLonCoord(pub geo::Coord);
+pub struct LonLatCoord(pub geo::Coord);
+
+#[expect(clippy::unreachable, reason = "This is just a 2D coordinate.")]
+impl rstar::Point for LonLatCoord {
+    type Scalar = f64;
+    const DIMENSIONS: usize = 2;
+
+    fn generate(mut generator: impl FnMut(usize) -> Self::Scalar) -> Self {
+        Self(geo::coord! {
+            x: generator(0),
+            y: generator(1),
+        })
+    }
+
+    fn nth(&self, index: usize) -> Self::Scalar {
+        match index {
+            0 => self.0.x,
+            1 => self.0.y,
+            _ => unreachable!(),
+        }
+    }
+
+    fn nth_mut(&mut self, index: usize) -> &mut Self::Scalar {
+        match index {
+            0 => &mut self.0.x,
+            1 => &mut self.0.y,
+            _ => unreachable!(),
+        }
+    }
+}
 
 /// Convert between different coordinate system.
 pub struct Convert {
     /// The lat/lon base coordinates for the AEQD mercator projected coordinates.
-    pub base: LatLonCoord,
+    pub base: LonLatCoord,
 }
 
 impl Convert {
@@ -32,7 +61,7 @@ impl Convert {
     }
 
     /// Convert from degrees to the AEQD metric projection.
-    pub fn to_meters(&self, source: LatLonCoord) -> Result<geo::Coord> {
+    pub fn to_meters(&self, source: LonLatCoord) -> Result<geo::Coord> {
         let mut converted = (source.0.x.to_radians(), source.0.y.to_radians(), 0.0f64);
         proj4rs::transform::transform(
             &Self::degrees_projection()?,
@@ -44,7 +73,7 @@ impl Convert {
     }
 
     /// Convert from the AEQD metric projection to degrees.
-    pub fn to_degrees(&self, source: geo::Coord) -> Result<LatLonCoord> {
+    pub fn to_degrees(&self, source: geo::Coord) -> Result<LonLatCoord> {
         let mut converted = (source.x, source.y, 0.0f64);
         proj4rs::transform::transform(
             &self.meters_projection()?,
@@ -52,7 +81,7 @@ impl Convert {
             &mut converted,
         )?;
 
-        Ok(LatLonCoord(
+        Ok(LonLatCoord(
             geo::coord! { x: converted.0.to_degrees(), y: converted.1.to_degrees() },
         ))
     }
@@ -83,7 +112,7 @@ mod test {
 
     #[test]
     fn bristol_to_meters() {
-        let base = LatLonCoord(geo::Coord {
+        let base = LonLatCoord(geo::Coord {
             x: -2.5879,
             y: 51.4545,
         });
@@ -96,14 +125,14 @@ mod test {
 
     #[test]
     fn bristolish_to_meters() {
-        let base = LatLonCoord(geo::Coord {
+        let base = LonLatCoord(geo::Coord {
             x: -2.5879,
             y: 51.4545,
         });
         let converter = Convert { base };
         assert_eq!(
             converter
-                .to_meters(LatLonCoord(geo::Coord {
+                .to_meters(LonLatCoord(geo::Coord {
                     x: -2.573510680530247,
                     y: 51.463487311585936
                 }))
@@ -117,14 +146,14 @@ mod test {
 
     #[test]
     fn bristol_to_degrees() {
-        let base = LatLonCoord(geo::Coord {
+        let base = LonLatCoord(geo::Coord {
             x: -2.5879,
             y: 51.4545,
         });
         let converter = Convert { base };
         assert_eq!(
             converter.to_degrees(geo::Coord { x: 0.0, y: 0.0 }).unwrap(),
-            LatLonCoord(geo::Coord {
+            LonLatCoord(geo::Coord {
                 x: -2.5879,
                 y: 51.45450000000001
             })
@@ -133,7 +162,7 @@ mod test {
 
     #[test]
     fn bristolish_to_degrees() {
-        let base = LatLonCoord(geo::Coord {
+        let base = LonLatCoord(geo::Coord {
             x: -2.5879,
             y: 51.4545,
         });
@@ -145,7 +174,7 @@ mod test {
                     y: 1000.0
                 })
                 .unwrap(),
-            LatLonCoord(geo::Coord {
+            LonLatCoord(geo::Coord {
                 x: -2.573510680530247,
                 y: 51.463487311585936
             })
